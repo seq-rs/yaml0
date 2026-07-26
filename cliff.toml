@@ -1,0 +1,61 @@
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project are documented here.
+
+"""
+body = """
+{% set repo_url = "https://github.com/" ~ remote.github.owner ~ "/" ~ remote.github.repo -%}
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}]({{ repo_url }}/-/releases/tag/{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## [Latest]
+{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits -%}
+- {% if commit.breaking %}**[breaking]** {% endif -%}
+{% if commit.scope and commit.scope not in ["docs", "deps", "ci", "cicd", "ci/cd"] -%}
+**({{ commit.scope }})** {% endif -%}
+{{ commit.message | trim | upper_first }} \
+([`{{ commit.id | truncate(length=7, end="") }}`]({{ repo_url }}/-/commit/{{ commit.id }}))
+{% endfor %}
+{% endfor %}
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+commit_preprocessors = []
+filter_commits = true
+tag_pattern = "v?[0-9]+\\.[0-9]+\\.[0-9]+.*"
+sort_commits = "newest"
+topo_order = false
+protect_breaking_commits = false
+
+commit_parsers = [
+  { message = "^security(\\(.+\\))?:", group = "<!-- 0 -->Security" },
+  { message = "^feat(\\(.+\\))?:", group = "<!-- 1 -->Features" },
+  { message = "^add(\\(.+\\))?:", group = "<!-- 1 -->Features" },
+  { message = "^fix(\\(.+\\))?:", group = "<!-- 2 -->Fixes" },
+  { message = "^update(\\(.+\\))?:", group = "<!-- 3 -->Improvements" },
+  { message = "^refactor(\\(.+\\))?:", group = "<!-- 3 -->Improvements" },
+  { message = "^del(\\(.+\\))?:", group = "<!-- 4 -->Removed" },
+  { message = "^docs(\\(.+\\))?:", group = "<!-- 5 -->Documentation" },
+  { message = "^chore\\(docs\\):", group = "<!-- 5 -->Documentation" },
+  { message = "^deps(\\(.+\\))?:", group = "<!-- 6 -->Dependencies" },
+  { message = "^chore\\(deps\\):", group = "<!-- 6 -->Dependencies" },
+  { message = "^ci(\\(.+\\))?:", group = "<!-- 7 -->Release process" },
+  { message = "^chore\\(ci\\):", group = "<!-- 7 -->Release process" },
+  { message = "^chore\\(cicd\\):", group = "<!-- 7 -->Release process" },
+  { message = "^chore\\(ci/cd\\):", group = "<!-- 7 -->Release process" },
+  { message = ".*", skip = true },
+]
+
+[remote.github]
+owner = "seq-rs"
+repo = "yaml0"
