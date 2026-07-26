@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: seq-rs/actions/rust-cache@v1
       - run: cargo check --workspace
       - run: cargo test --workspace
       - run: cargo clippy --workspace -- -D warnings
