@@ -1,18 +1,32 @@
+mod block_map;
 mod block_scalar;
+mod block_seq;
 mod cursor;
 mod escape;
 mod flow;
-mod block_map;
 mod scalar;
-mod block_seq;
 
 use std::{borrow::Cow, collections::HashMap};
 
 use crate::{
-    Result, BorrowedValue,
-    patterns::resolve_scalar,
+    BorrowedValue, Result,
     borrowed_value::{apply_tag, resolve_merge_keys},
+    patterns::resolve_scalar,
 };
+
+pub(super) enum ScalarToken<'a> {
+    Plain(Cow<'a, str>),
+    Quoted(Cow<'a, str>),
+}
+
+impl<'a> ScalarToken<'a> {
+    pub(super) fn into_value(self) -> BorrowedValue<'a> {
+        match self {
+            Self::Plain(s) => resolve_scalar(s),
+            Self::Quoted(s) => BorrowedValue::String(s),
+        }
+    }
+}
 
 /// YAML parser cursor over a borrowed source string.
 ///
@@ -66,6 +80,8 @@ impl<'a> Parser<'a> {
     /// directives. Anchors are reset between documents per spec §9.1.
     pub fn parse_all(&mut self) -> Result<Vec<BorrowedValue<'a>>> {
         let mut docs = Vec::new();
+        let mut allow_bare = true;
+
         loop {
             self.skip_blank_and_comment_lines();
             self.skip_directives();
@@ -76,16 +92,25 @@ impl<'a> Parser<'a> {
 
             if self.at_doc_marker(b"---") {
                 self.consume_doc_marker(3);
+            } else if !allow_bare {
+                let indent = self.current_indent()?;
+
+                // point at content, not col 1
+                for _ in 0..indent {
+                    self.advance();
+                }
+
+                return Err(self.err("unexpected content; expected '---' to start a new document"));
             }
 
             // Spec-mandated reset of anchor scope at document boundaries
             self.anchors.clear();
 
-            let doc = resolve_merge_keys(self.parse_node(0)?);
-            docs.push(doc);
+            docs.push(resolve_merge_keys(self.parse_node(0)?));
 
             self.skip_blank_and_comment_lines();
-            if self.at_doc_marker(b"...") {
+            allow_bare = self.at_doc_marker(b"...");
+            if allow_bare {
                 self.consume_doc_marker(3);
             }
         }
@@ -103,9 +128,7 @@ impl<'a> Parser<'a> {
         match docs.len() {
             0 => Ok(BorrowedValue::Null),
             1 => Ok(docs.pop().unwrap()),
-            n => Err(self.err(format!(
-                "expected single document, got {n}"
-            ))),
+            n => Err(self.err(format!("expected single document, got {n}"))),
         }
     }
 
@@ -124,6 +147,16 @@ impl<'a> Parser<'a> {
         }
         self.skip_spaces();
         self.consume_one_line_break();
+    }
+
+    pub(super) fn is_doc_marker_at(&self, pos: usize, marker: &[u8]) -> bool {
+        let b = self.src.as_bytes();
+        b.len() >= pos + marker.len()
+            && &b[pos..pos + marker.len()] == marker
+            && matches!(
+                b.get(pos + marker.len()),
+                None | Some(b' ' | b'\t' | b'\n' | b'\r')
+            )
     }
 
     /// Parse a single YAML node (scalar, seq, map, tagged, or empty)
@@ -203,7 +236,7 @@ impl<'a> Parser<'a> {
         let value = if (tag.is_some() || anchor.is_some()) && self.at_line_end() {
             self.parse_node(min_indent)?
         } else {
-            self.dispatch(indent)?
+            self.dispatch(indent, min_indent)?
         };
 
         let value = match tag {
@@ -219,7 +252,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Route the cursor to the right node parser based on the next byte
-    fn dispatch(&mut self, indent: usize) -> Result<BorrowedValue<'a>> {
+    fn dispatch(&mut self, indent: usize, min_indent: usize) -> Result<BorrowedValue<'a>> {
         match self.peek() {
             None => Ok(BorrowedValue::Null),
             Some(b'[') => self.parse_flow_seq(),
@@ -227,8 +260,8 @@ impl<'a> Parser<'a> {
             Some(b'|') => self.parse_block_scalar(),
             Some(b'>') => self.parse_block_scalar(),
             Some(b'*') => self.parse_alias(),
-            Some(b'-') if self.is_seq_dash() => self.parse_block_seq(indent),
-            _ => self.parse_scalar_or_map(indent),
+            Some(b'-') if self.at_seq_dash() => self.parse_block_seq(indent),
+            _ => self.parse_scalar_or_map(indent, min_indent),
         }
     }
 
@@ -352,11 +385,26 @@ impl<'a> Parser<'a> {
         Ok(Some(tag))
     }
 
-    fn is_seq_dash(&self) -> bool {
-        matches!(
-            self.peek_at(self.pos + 1),
-            None | Some(b' ' | b'\t' | b'\n' | b'\r')
-        )
+    /// Whether the next character is a `-` at e.g. start of a sequence
+    fn at_seq_dash(&self) -> bool {
+        self.is_seq_dash_at(self.pos)
+    }
+
+    /// Whether the character at position `pos` is a `-` at e.g. the start of a sequence
+    fn is_seq_dash_at(&self, pos: usize) -> bool {
+        self.peek_at(pos) == Some(b'-')
+            && matches!(self.peek_at(pos + 1), None | Some(b' ' | b'\t' | b'\n' | b'\r'))
+    }
+
+    fn finish_value_token(
+        &mut self,
+        tok: ScalarToken<'a>,
+        min_indent: usize,
+    ) -> Result<BorrowedValue<'a>> {
+        Ok(match tok {
+            ScalarToken::Plain(s) => resolve_scalar(self.fold_plain_continuation(s, min_indent)?),
+            ScalarToken::Quoted(s) => BorrowedValue::String(s),
+        })
     }
 
     /// Parse one scalar token (plain, double-quoted, or single-quoted)
@@ -364,18 +412,23 @@ impl<'a> Parser<'a> {
     /// Input: `"42"` → Output: `BorrowedValue::String("42")` (quoted stays string)
     /// Input: `42`   → Output: `BorrowedValue::Int(42)` (plain resolves via `resolve_scalar`)
     fn parse_scalar_token(&mut self) -> Result<BorrowedValue<'a>> {
-        use BorrowedValue::*;
+        Ok(self.read_scalar_token()?.into_value())
+    }
+
+    /// Parse a scalar token, either double-quoted, single-quoted or plain
+    ///
+    /// `"42"` => ScalarToken::Quoted(42)
+    /// `'42'` => ScalarToken::Quoted(42)
+    /// `42` => ScalarToken::Plain(42)
+    fn read_scalar_token(&mut self) -> Result<ScalarToken<'a>> {
         match self.peek() {
-            Some(b'"') => Ok(String(
+            Some(b'"') => Ok(ScalarToken::Quoted(
                 self.parse_double_quoted(self.col.saturating_sub(1))?,
             )),
-            Some(b'\'') => Ok(String(
+            Some(b'\'') => Ok(ScalarToken::Quoted(
                 self.parse_single_quoted(self.col.saturating_sub(1))?,
             )),
-            _ => {
-                let s = self.parse_plain_scalar(false);
-                Ok(resolve_scalar(s))
-            }
+            _ => Ok(ScalarToken::Plain(self.parse_plain_scalar(false))),
         }
     }
 }
@@ -667,8 +720,12 @@ mod tests {
     fn stream_two_explicit_docs() {
         let docs = parse_all("---\na: 1\n---\nb: 2\n");
         assert_eq!(docs.len(), 2);
-        assert!(matches!(&docs[0], BorrowedValue::Map(p) if matches!(&p[0].0, BorrowedValue::String(s) if s == "a")));
-        assert!(matches!(&docs[1], BorrowedValue::Map(p) if matches!(&p[0].0, BorrowedValue::String(s) if s == "b")));
+        assert!(
+            matches!(&docs[0], BorrowedValue::Map(p) if matches!(&p[0].0, BorrowedValue::String(s) if s == "a"))
+        );
+        assert!(
+            matches!(&docs[1], BorrowedValue::Map(p) if matches!(&p[0].0, BorrowedValue::String(s) if s == "b"))
+        );
     }
 
     #[test]
@@ -844,17 +901,24 @@ target:
     fn merge_no_merge_key_untouched() {
         let pairs = map_pairs(parse("a: 1\nb: 2\n"));
         assert_eq!(pairs.len(), 2);
-        assert!(!pairs.iter().any(|(k, _)| matches!(k, BorrowedValue::String(s) if s == "<<")));
+        assert!(
+            !pairs
+                .iter()
+                .any(|(k, _)| matches!(k, BorrowedValue::String(s) if s == "<<"))
+        );
     }
 
     #[test]
     fn merge_non_map_value_dropped() {
         // <<: 42 is invalid; should be silently dropped
         let pairs = map_pairs(parse("k: v\n'<<': 42\n"));
-        let keys: Vec<String> = pairs.iter().filter_map(|(k, _)| match k {
-            BorrowedValue::String(s) => Some(s.to_string()),
-            _ => None,
-        }).collect();
+        let keys: Vec<String> = pairs
+            .iter()
+            .filter_map(|(k, _)| match k {
+                BorrowedValue::String(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect();
         assert!(!keys.contains(&"<<".to_string()));
         assert!(keys.contains(&"k".to_string()));
     }
@@ -983,5 +1047,112 @@ services:
         assert!(matches!(get(web, "image"), BorrowedValue::String(s) if s == "nginx"));
         assert!(matches!(get(web, "restart"), BorrowedValue::String(s) if s == "always"));
         assert!(matches!(get(api, "restart"), BorrowedValue::String(s) if s == "on-failure")); // override
+    }
+
+    // --- multi-line plain scalars at stream level ---
+
+    #[test]
+    fn top_level_scalar_folds() {
+        let v = parse("one\ntwo\n");
+        assert!(matches!(v, BorrowedValue::String(s) if s == "one two"));
+    }
+
+    #[test]
+    fn fold_stops_at_start_marker() {
+        let docs = Parser::new("one\n---\ntwo\n").parse_all().unwrap();
+        assert_eq!(docs.len(), 2);
+        assert!(matches!(&docs[0], BorrowedValue::String(s) if s == "one"));
+        assert!(matches!(&docs[1], BorrowedValue::String(s) if s == "two"));
+    }
+
+    #[test]
+    fn fold_stops_at_end_marker() {
+        let docs = Parser::new("one\n...\ntwo\n").parse_all().unwrap();
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[test]
+    fn quoted_value_does_not_fold() {
+        // a quoted scalar ends at its closing quote; the next line is orphaned
+        let err = Parser::new("a: \"one\"\n  two\n").parse().unwrap_err();
+        assert_eq!((err.line, err.col), (Some(2), Some(3)));
+    }
+
+    // --- document boundaries (§9.2 l-yaml-stream) ---
+
+    #[test]
+    fn second_bare_document_errors() {
+        let err = Parser::new("{a: 1}\n{b: 2}\n").parse_all().unwrap_err();
+        assert_eq!((err.line, err.col), (Some(2), Some(1)));
+        assert!(err.msg.contains("---"), "got {}", err.msg);
+    }
+
+    #[test]
+    fn orphan_error_points_at_content_not_column_one() {
+        let err = Parser::new("a: \"one\"\n    two\n")
+            .parse_all()
+            .unwrap_err();
+        assert_eq!((err.line, err.col), (Some(2), Some(5)));
+    }
+
+    #[test]
+    fn bare_single_document() {
+        assert_eq!(Parser::new("a: 1\n").parse_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn leading_marker_single_document() {
+        assert_eq!(Parser::new("---\na: 1\n").parse_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn explicit_multi_document() {
+        let docs = Parser::new("---\na: 1\n---\nb: 2\n").parse_all().unwrap();
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[test]
+    fn bare_document_after_end_marker() {
+        // [211] permits a bare document after a `...` suffix. libyaml and
+        // go-yaml reject this; the grammar does not.
+        assert_eq!(
+            Parser::new("a: 1\n...\nb: 2\n").parse_all().unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn explicit_document_after_end_marker() {
+        assert_eq!(
+            Parser::new("a: 1\n...\n---\nb: 2\n")
+                .parse_all()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn directive_then_marker() {
+        assert_eq!(
+            Parser::new("%YAML 1.2\n---\na: 1\n")
+                .parse_all()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn trailing_blanks_and_comments_end_the_stream() {
+        assert_eq!(
+            Parser::new("a: 1\n\n# done\n").parse_all().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn empty_input_is_null() {
+        assert!(matches!(parse(""), BorrowedValue::Null));
     }
 }

@@ -26,16 +26,24 @@ impl<'a> Parser<'a> {
 
             // Normalize: if not already at dash, advance past indent
             if self.peek() != Some(b'-') {
-                if self.current_indent()? != indent {
+                let cur = self.current_indent()?;
+                // If indentation is not the same as the current line, we stop
+                if cur != indent {
                     // Confirm current indentation
                     break;
                 }
+
+                // If the next line doesn't have a dash with the same indentation, we stop
+                if !self.is_seq_dash_at(self.pos + cur) {
+                    break;
+                }
+
                 for _ in 0..indent {
                     self.advance();
                 }
             }
 
-            if self.peek() != Some(b'-') || !self.is_seq_dash() {
+            if self.peek() != Some(b'-') || !self.at_seq_dash() {
                 // Need start with dash
                 break;
             }
@@ -139,5 +147,25 @@ mod tests {
         let mut p = Parser::new("");
         let v = p.parse_block_seq(0).unwrap();
         assert!(matches!(v, BorrowedValue::Seq(items) if items.is_empty()));
+    }
+
+    #[test]
+    fn seq_item_folds_continuation() {
+        assert_seq!("- one\n  two\n", vec!["one two"]);
+    }
+
+    #[test]
+    fn seq_fold_stops_at_next_item() {
+        assert_seq!("- one\n- two\n", vec!["one", "two"]);
+    }
+
+    #[test]
+    fn seq_fold_empty_line_becomes_newline() {
+        assert_seq!("- one\n\n  two\n", vec!["one\ntwo"]);
+    }
+
+    #[test]
+    fn seq_fold_strips_extra_indent() {
+        assert_seq!("- one\n      two\n", vec!["one two"]);
     }
 }

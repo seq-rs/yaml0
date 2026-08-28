@@ -185,20 +185,7 @@ impl<'a> Parser<'a> {
     /// True when cursor is at column 1 and starts with `marker` followed
     /// by whitespace, newline, or EOF — the spec rule for `---` and `...`
     pub(super) fn at_doc_marker(&self, marker: &[u8]) -> bool {
-        if self.col != 1 {
-            return false;
-        }
-        let bytes = self.src.as_bytes();
-        if self.pos + marker.len() > bytes.len() {
-            return false;
-        }
-        if &bytes[self.pos..self.pos + marker.len()] != marker {
-            return false;
-        }
-        matches!(
-            bytes.get(self.pos + marker.len()),
-            None | Some(b' ' | b'\t' | b'\n' | b'\r')
-        )
+        self.col == 1 && self.is_doc_marker_at(self.pos, marker)
     }
 
     pub(super) fn skip_flow_whitespace(&mut self) {

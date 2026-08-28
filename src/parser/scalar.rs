@@ -16,6 +16,104 @@ impl<'a> Parser<'a> {
         self.pos == 0 || matches!(self.src.as_bytes()[self.pos - 1], b' ' | b'\t')
     }
 
+    pub(super) fn fold_plain_continuation(
+        &mut self,
+        first: Cow<'a, str>,
+        min_indent: usize,
+    ) -> Result<Cow<'a, str>> {
+        let mut out: Option<String> = None;
+        loop {
+            if self.peek() == Some(b':') {
+                return Err(self.err("mapping values are not allowed in this context"));
+            }
+            if !self.at_line_end() {
+                break;
+            }
+            let Some((breaks, content)) = self.peek_plain_continuation(min_indent) else {
+                break;
+            };
+
+            let out = out.get_or_insert_with(|| first.to_string());
+
+            while self.pos < content {
+                self.advance();
+            }
+
+            if breaks == 1 {
+                out.push(' ')
+            } else {
+                for _ in 1..breaks {
+                    out.push('\n')
+                }
+            }
+            out.push_str(&self.parse_plain_scalar(false));
+        }
+        Ok(out.map_or(first, Cow::Owned))
+    }
+
+    fn peek_plain_continuation(&self, min_indent: usize) -> Option<(usize, usize)> {
+        let bytes = self.src.as_bytes();
+        let mut i = self.pos;
+        let mut breaks = 0;
+
+        loop {
+            match bytes.get(i) {
+                // one line break, CRLF counts as one
+                Some(b'\r') => {
+                    i += 1;
+                    if bytes.get(i) == Some(&b'\n') {
+                        i += 1;
+                    }
+                }
+                Some(b'\n') => i += 1,
+                // EOF, or cursor wasn't on a break after all
+                _ => return None,
+            }
+
+            breaks += 1;
+
+            // `s-indent(n)`: spaces only
+            let line_start = i;
+            while bytes.get(i) == Some(&b' ') {
+                i += 1;
+            }
+
+            let indent = i - line_start;
+
+            // `s-separate-in-line?`: tabs are legal separation past the indent
+            let mut content = i;
+            while matches!(bytes.get(content), Some(b' ' | b'\t')) {
+                content += 1;
+            }
+
+            match bytes.get(content) {
+                // trailing whitespace then EOF: no continuation
+                None => return None,
+                // empty line: keep counting breaks
+                Some(b'\n' | b'\r') => {
+                    i = content;
+                    continue;
+                }
+                // a comment line ends the scalar
+                Some(b'#') => return None,
+                _ => {}
+            }
+
+            if indent < min_indent {
+                return None;
+            }
+
+            if indent == 0
+                && (self.is_doc_marker_at(content, b"---")
+                    || self.is_doc_marker_at(content, b"..."))
+            {
+                return None;
+            }
+
+            return Some((breaks, content));
+        }
+    }
+
     /// Read an unquoted plain scalar from the current cursor
     ///
     /// Input: `hello world\n` → Output: `Cow::Borrowed("hello world")`
@@ -182,11 +280,9 @@ impl<'a> Parser<'a> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     macro_rules! assert_plain_scalar {
         ($yaml:literal, $expected:literal, $flow:literal) => {
@@ -571,5 +667,108 @@ mod tests {
     fn sq_err_unterminated() {
         let mut p = Parser::new(r#"'foo"#);
         assert!(p.parse_single_quoted(0).is_err());
+    }
+
+    // --- plain continuation lookahead (§7.3.3 s-ns-plain-next-line) ---
+
+    macro_rules! assert_cont {
+        ($src:literal, $min:literal, $expected:expr) => {
+            let p = Parser::new($src);
+            assert_eq!(p.peek_plain_continuation($min), $expected);
+        };
+    }
+
+    #[test]
+    fn cont_single_break() {
+        assert_cont!("\n  two", 1, Some((1, 3)));
+    }
+
+    #[test]
+    fn cont_counts_empty_lines() {
+        assert_cont!("\n\n  two", 1, Some((2, 4)));
+        assert_cont!("\n\n\n  two", 1, Some((3, 5)));
+    }
+
+    #[test]
+    fn cont_crlf_counts_as_one_break() {
+        assert_cont!("\r\n  two", 1, Some((1, 4)));
+    }
+
+    #[test]
+    fn cont_indent_equal_to_min_qualifies() {
+        // s-indent(n) demands at least n, not more than n
+        assert_cont!("\n  two", 2, Some((1, 3)));
+    }
+
+    #[test]
+    fn cont_indent_below_min_stops() {
+        assert_cont!("\n  two", 3, None);
+    }
+
+    #[test]
+    fn cont_dedented_sibling_stops() {
+        assert_cont!("\nb: 2", 1, None);
+    }
+
+    #[test]
+    fn cont_comment_line_stops() {
+        assert_cont!("\n  # c", 1, None);
+    }
+
+    #[test]
+    fn cont_eof_stops() {
+        assert_cont!("\n", 0, None);
+        assert_cont!("", 0, None);
+        // trailing blank lines are not consumed as a continuation
+        assert_cont!("\n   \n  \n", 0, None);
+    }
+
+    #[test]
+    fn cont_requires_cursor_on_a_break() {
+        assert_cont!("two", 0, None);
+    }
+
+    #[test]
+    fn cont_tab_past_indent_is_separation() {
+        // s-separate-in-line: tabs are legal once s-indent(n) is satisfied
+        assert_cont!("\n \ttwo", 1, Some((1, 3)));
+    }
+
+    #[test]
+    fn cont_tab_inside_indent_stops() {
+        // indent counts spaces only; current_indent reports the tab downstream
+        assert_cont!("\n\ttwo", 1, None);
+    }
+
+    #[test]
+    fn cont_doc_markers_stop() {
+        assert_cont!("\n---\ntwo", 0, None);
+        assert_cont!("\n...\ntwo", 0, None);
+    }
+
+    #[test]
+    fn cont_doc_marker_prefix_is_content() {
+        // `---x` is not a marker
+        assert_cont!("\n---x\n", 0, Some((1, 1)));
+    }
+
+    // --- fold allocation behaviour ---
+
+    #[test]
+    fn fold_single_line_stays_borrowed() {
+        let mut p = Parser::new("one\n");
+        let first = p.parse_plain_scalar(false);
+        let folded = p.fold_plain_continuation(first, 0).unwrap();
+        assert_eq!(folded, "one");
+        assert!(matches!(folded, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn fold_continuation_allocates() {
+        let mut p = Parser::new("one\n  two\n");
+        let first = p.parse_plain_scalar(false);
+        let folded = p.fold_plain_continuation(first, 1).unwrap();
+        assert_eq!(folded, "one two");
+        assert!(matches!(folded, Cow::Owned(_)));
     }
 }

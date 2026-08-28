@@ -1,4 +1,4 @@
-use crate::{Parser, Result, BorrowedValue};
+use crate::{BorrowedValue, Parser, Result};
 
 impl<'a> Parser<'a> {
     /// Parse a scalar OR an implicit-key block map starting with that scalar
@@ -13,19 +13,25 @@ impl<'a> Parser<'a> {
     ///
     /// Input: `foo\n` → Output: `BorrowedValue::String("foo")` (no `:` follows the
     /// first token, so it's a bare scalar).
-    pub(super) fn parse_scalar_or_map(&mut self, indent: usize) -> Result<BorrowedValue<'a>> {
-        let first = self.parse_scalar_token()?;
+    pub(super) fn parse_scalar_or_map(
+        &mut self,
+        indent: usize,
+        min_indent: usize,
+    ) -> Result<BorrowedValue<'a>> {
+        let first = self.read_scalar_token()?;
 
         self.skip_spaces();
 
         if !self.is_kv_colon() {
-            return Ok(first);
+            return self.finish_value_token(first, min_indent);
         }
 
         self.advance(); // consume ':'
 
+        let key = first.into_value();
+
         let value = self.parse_block_map_value(indent)?;
-        let mut pairs = vec![(first, value)];
+        let mut pairs = vec![(key, value)];
 
         self.parse_block_map_rest(indent, &mut pairs)?;
         Ok(BorrowedValue::Map(pairs))
@@ -67,7 +73,7 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
 
-            if self.peek() == Some(b'-') && self.is_seq_dash() {
+            if self.peek() == Some(b'-') && self.at_seq_dash() {
                 break;
             }
 
@@ -99,7 +105,10 @@ impl<'a> Parser<'a> {
     /// Inline values (same line as the key) parse via `parse_node`.
     /// Multi-line values handle indent locally to support the compact-seq
     /// form (`key:\n- item`) where the dash sits at the parent's indent.
-    pub(super) fn parse_block_map_value(&mut self, parent_indent: usize) -> Result<BorrowedValue<'a>> {
+    pub(super) fn parse_block_map_value(
+        &mut self,
+        parent_indent: usize,
+    ) -> Result<BorrowedValue<'a>> {
         self.skip_spaces();
 
         // Inline value (same line as key): cursor at value byte
@@ -143,7 +152,7 @@ impl<'a> Parser<'a> {
         for _ in 0..next_indent {
             self.advance();
         }
-        self.dispatch(next_indent)
+        self.dispatch(next_indent, parent_indent + 1)
     }
 
     fn is_kv_colon(&self) -> bool {
@@ -383,5 +392,131 @@ mod tests {
         };
         assert_eq!(pairs.len(), 2);
         assert!(matches!(pairs[0].1, BorrowedValue::Null));
+    }
+
+    // --- plain scalar line folding (§7.3.3) ---
+
+    fn map_get<'a, 'b>(v: &'b BorrowedValue<'a>, key: &str) -> &'b BorrowedValue<'a> {
+        match v {
+            BorrowedValue::Map(pairs) => pairs
+                .iter()
+                .find(|(k, _)| matches!(k, BorrowedValue::String(s) if s == key))
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("no key {key}")),
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fold_inline_map_value() {
+        assert_map_strs!("a: one\n  two\n", vec![("a", "one two")]);
+    }
+
+    #[test]
+    fn fold_three_lines() {
+        assert_map_strs!("a: one\n  two\n  three\n", vec![("a", "one two three")]);
+    }
+
+    #[test]
+    fn fold_block_value_equal_indent() {
+        // continuation sits at the same indent as the first content line
+        assert_map_strs!("a:\n  one\n  two\n", vec![("a", "one two")]);
+    }
+
+    #[test]
+    fn fold_value_less_indented_than_first_line() {
+        // threshold is parent_indent + 1, not the first content line's indent
+        assert_map_strs!("a:\n    one\n  two\n", vec![("a", "one two")]);
+    }
+
+    #[test]
+    fn fold_strips_extra_indent() {
+        // more-indented lines fold to a space; that rule is block-folded-scalar only
+        assert_map_strs!("a: one\n      two\n", vec![("a", "one two")]);
+    }
+
+    #[test]
+    fn fold_empty_line_becomes_newline() {
+        assert_map_strs!("a: one\n\n  two\n", vec![("a", "one\ntwo")]);
+    }
+
+    #[test]
+    fn fold_two_empty_lines_become_two_newlines() {
+        assert_map_strs!("a: one\n\n\n  two\n", vec![("a", "one\n\ntwo")]);
+    }
+
+    #[test]
+    fn fold_crlf() {
+        assert_map_strs!("a: one\r\n  two\r\n", vec![("a", "one two")]);
+    }
+
+    #[test]
+    fn fold_keeps_bare_colon() {
+        assert_map_strs!("a: one\n  two:three\n", vec![("a", "one two:three")]);
+    }
+
+    #[test]
+    fn fold_keeps_leading_dash() {
+        assert_map_strs!("a: one\n  - two\n", vec![("a", "one - two")]);
+    }
+
+    #[test]
+    fn fold_then_sibling_key() {
+        assert_map_strs!("a: one\n  two\nb: 3\n", vec![("a", "one two"), ("b", "3")]);
+    }
+
+    #[test]
+    fn no_fold_sibling_key() {
+        assert_map_strs!("a: one\nb: two\n", vec![("a", "one"), ("b", "two")]);
+    }
+
+    #[test]
+    fn no_fold_comment_line() {
+        assert_map_strs!("a: one\n  # c\nb: 2\n", vec![("a", "one"), ("b", "2")]);
+    }
+
+    #[test]
+    fn fold_stops_at_comment_after_continuation() {
+        assert_map_strs!(
+            "a: one\n  two\n  # c\nb: 2\n",
+            vec![("a", "one two"), ("b", "2")]
+        );
+    }
+
+    #[test]
+    fn fold_at_nested_key_indent() {
+        // key at indent 4, continuation at indent 6 (the GitLab OpenAPI shape)
+        let mut p = Parser::new("info:\n  license:\n    note: first line\n      second line\n");
+        let v = p.parse_node(0).unwrap();
+        let note = map_get(map_get(map_get(&v, "info"), "license"), "note");
+        assert!(matches!(note, BorrowedValue::String(s) if s == "first line second line"));
+    }
+
+    #[test]
+    fn fold_blocks_numeric_resolution() {
+        // folding happens before resolve_scalar, so this is a string
+        let mut p = Parser::new("a: 1\n  2\n");
+        let v = p.parse_node(0).unwrap();
+        let a = map_get(&v, "a");
+        assert!(matches!(a, BorrowedValue::String(s) if s == "1 2"), "got {a:?}");
+    }
+
+    #[test]
+    fn no_fold_across_dedent_to_outer_map() {
+        let mut p = Parser::new("x:\n  a: one\nb: 2\n");
+        let v = p.parse_node(0).unwrap();
+        match &v {
+            BorrowedValue::Map(pairs) => assert_eq!(pairs.len(), 2),
+            other => panic!("expected Map, got {other:?}"),
+        }
+        assert!(matches!(map_get(&v, "b"), BorrowedValue::Int(2)));
+    }
+
+    #[test]
+    fn colon_on_continuation_line_errors() {
+        // an implicit key is single-line; this is `mapping values are not allowed`
+        let mut p = Parser::new("a: foo\n  bar: baz\n");
+        let err = p.parse_node(0).unwrap_err();
+        assert_eq!((err.line, err.col), (Some(2), Some(6)));
     }
 }
