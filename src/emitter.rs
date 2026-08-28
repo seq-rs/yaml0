@@ -1,5 +1,5 @@
-use crate::Result;
 use crate::BorrowedValue;
+use crate::Result;
 use crate::patterns::has_ctrl_chars;
 use crate::patterns::has_newline;
 use crate::patterns::needs_quotes;
@@ -49,7 +49,6 @@ fn emit_bool(b: bool, out: &mut String) {
 fn emit_int(n: &i64, out: &mut String) {
     write!(out, "{n}").unwrap();
 }
-
 
 fn emit_float(f: &f64, out: &mut String) {
     if f.is_nan() {
@@ -150,7 +149,11 @@ fn emit_block_seq(items: &[BorrowedValue<'_>], indent: usize, out: &mut String) 
     Ok(())
 }
 
-fn emit_block_map(pairs: &[(BorrowedValue<'_>, BorrowedValue<'_>)], indent: usize, out: &mut String) -> Result<()> {
+fn emit_block_map(
+    pairs: &[(BorrowedValue<'_>, BorrowedValue<'_>)],
+    indent: usize,
+    out: &mut String,
+) -> Result<()> {
     if pairs.is_empty() {
         out.push('{');
         out.push('}');
@@ -164,9 +167,24 @@ fn emit_block_map(pairs: &[(BorrowedValue<'_>, BorrowedValue<'_>)], indent: usiz
     Ok(())
 }
 
-fn emit_kv(kv: &(BorrowedValue<'_>, BorrowedValue<'_>), indent: usize, out: &mut String) -> Result<()> {
+fn emit_kv(
+    kv: &(BorrowedValue<'_>, BorrowedValue<'_>),
+    indent: usize,
+    out: &mut String,
+) -> Result<()> {
     let (k, v) = kv;
-    emit_node(k, indent, out)?;
+    if key_needs_explicit(k) {
+        out.push('?');
+
+        if !emits_leading_break(k) {
+            out.push(' ');
+        }
+        emit_node(k, indent + 2, out)?;
+        out.push('\n');
+        push_indent(out, indent);
+    } else {
+        emit_node(k, indent, out)?;
+    }
     out.push(':');
     if is_inline(v) {
         out.push(' ');
@@ -190,5 +208,117 @@ fn is_inline(v: &BorrowedValue<'_>) -> bool {
         BorrowedValue::Map(items) if !items.is_empty() => false,
         BorrowedValue::Tagged(_, value) => is_inline(value),
         _ => true,
+    }
+}
+
+fn key_needs_explicit(k: &BorrowedValue<'_>) -> bool {
+    match k {
+        BorrowedValue::String(s) => has_newline(s),
+        BorrowedValue::Tagged(_, inner) => key_needs_explicit(inner),
+        // flow nodes are legal implicit keys, but the parser does not read
+        // them in key position yet
+        BorrowedValue::Seq(_) | BorrowedValue::Map(_) => true,
+        _ => false,
+    }
+}
+
+/// True when [`emit_node`] opens its output with a line break
+fn emits_leading_break(v: &BorrowedValue<'_>) -> bool {
+    match v {
+        BorrowedValue::Seq(items) => !items.is_empty(),
+        BorrowedValue::Map(pairs) => !pairs.is_empty(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Parser;
+    use std::borrow::Cow;
+
+    fn s(x: &str) -> BorrowedValue<'_> {
+        BorrowedValue::String(Cow::Borrowed(x))
+    }
+
+    /// Emit, reparse, and assert the value survives; returns the emitted text
+    fn roundtrip(v: &BorrowedValue<'_>) -> String {
+        let out = emit(v).unwrap();
+        match Parser::new(&out).parse() {
+            Ok(back) => assert_eq!(&back, v, "roundtrip mismatch for {out:?}"),
+            Err(e) => panic!("emitted YAML does not reparse: {out:?} -> {e}"),
+        }
+        out
+    }
+
+    #[test]
+    fn simple_key_stays_implicit() {
+        let v = BorrowedValue::Map(vec![(s("a"), BorrowedValue::Int(1))]);
+        assert_eq!(roundtrip(&v), "a: 1\n");
+    }
+
+    #[test]
+    fn seq_key_uses_explicit_form() {
+        let v = BorrowedValue::Map(vec![(
+            BorrowedValue::Seq(vec![BorrowedValue::Int(1), BorrowedValue::Int(2)]),
+            s("v"),
+        )]);
+        assert_eq!(roundtrip(&v), "?\n  - 1\n  - 2\n: v\n");
+    }
+
+    #[test]
+    fn map_key_uses_explicit_form() {
+        let v = BorrowedValue::Map(vec![(
+            BorrowedValue::Map(vec![(s("a"), BorrowedValue::Int(1))]),
+            BorrowedValue::Int(9),
+        )]);
+        assert_eq!(roundtrip(&v), "?\n  a: 1\n: 9\n");
+    }
+
+    #[test]
+    fn multiline_string_key_uses_explicit_form() {
+        let v = BorrowedValue::Map(vec![(s("one\ntwo"), BorrowedValue::Int(1))]);
+        assert_eq!(roundtrip(&v), "? |-\n    one\n    two\n: 1\n");
+    }
+
+    #[test]
+    fn empty_container_key_uses_explicit_form() {
+        // `[]: 1` is valid YAML, but the parser does not read flow nodes in
+        // key position, so containers always take the explicit form
+        let seq = BorrowedValue::Map(vec![(BorrowedValue::Seq(vec![]), BorrowedValue::Int(1))]);
+        assert_eq!(roundtrip(&seq), "? []\n: 1\n");
+        let map = BorrowedValue::Map(vec![(BorrowedValue::Map(vec![]), BorrowedValue::Int(1))]);
+        assert_eq!(roundtrip(&map), "? {}\n: 1\n");
+    }
+
+    #[test]
+    fn explicit_key_with_container_value() {
+        let v = BorrowedValue::Map(vec![(
+            BorrowedValue::Seq(vec![BorrowedValue::Int(1)]),
+            BorrowedValue::Seq(vec![BorrowedValue::Int(2)]),
+        )]);
+        assert_eq!(roundtrip(&v), "?\n  - 1\n:\n  - 2\n");
+    }
+
+    #[test]
+    fn explicit_key_inside_seq_item() {
+        let v = BorrowedValue::Seq(vec![BorrowedValue::Map(vec![(
+            BorrowedValue::Seq(vec![BorrowedValue::Int(1)]),
+            BorrowedValue::Int(2),
+        )])]);
+        assert_eq!(roundtrip(&v), "- ?\n    - 1\n  : 2\n");
+    }
+
+    #[test]
+    fn tagged_container_key_keeps_the_indicator_separated() {
+        // the tag renders before the key body, so `?` still needs its space
+        let v = BorrowedValue::Map(vec![(
+            BorrowedValue::Tagged(
+                Cow::Borrowed("!k"),
+                Box::new(BorrowedValue::Seq(vec![BorrowedValue::Int(1)])),
+            ),
+            BorrowedValue::Int(2),
+        )]);
+        assert_eq!(roundtrip(&v), "? !k\n  - 1\n: 2\n");
     }
 }

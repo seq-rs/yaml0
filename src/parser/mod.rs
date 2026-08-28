@@ -392,8 +392,19 @@ impl<'a> Parser<'a> {
 
     /// Whether the character at position `pos` is a `-` at e.g. the start of a sequence
     fn is_seq_dash_at(&self, pos: usize) -> bool {
-        self.peek_at(pos) == Some(b'-')
-            && matches!(self.peek_at(pos + 1), None | Some(b' ' | b'\t' | b'\n' | b'\r'))
+        self.is_block_indicator_at(pos, b'-')
+    }
+
+    fn is_block_indicator_at(&self, pos: usize, ind: u8) -> bool {
+        self.peek_at(pos) == Some(ind)
+            && matches!(
+                self.peek_at(pos + 1),
+                None | Some(b' ' | b'\t' | b'\n' | b'\r')
+            )
+    }
+
+    fn at_explicit_key(&self) -> bool {
+        self.is_block_indicator_at(self.pos, b'?')
     }
 
     fn finish_value_token(

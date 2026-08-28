@@ -18,6 +18,13 @@ impl<'a> Parser<'a> {
         indent: usize,
         min_indent: usize,
     ) -> Result<BorrowedValue<'a>> {
+        if self.at_explicit_key() {
+            let entry = self.parse_explicit_entry(indent)?;
+            let mut pairs = vec![entry];
+            self.parse_block_map_rest(indent, &mut pairs)?;
+            return Ok(BorrowedValue::Map(pairs));
+        }
+
         let first = self.read_scalar_token()?;
 
         self.skip_spaces();
@@ -76,18 +83,21 @@ impl<'a> Parser<'a> {
             if self.peek() == Some(b'-') && self.at_seq_dash() {
                 break;
             }
+            let entry = if self.at_explicit_key() {
+                self.parse_explicit_entry(indent)?
+            } else {
+                let key = self.parse_scalar_token()?;
 
-            let key = self.parse_scalar_token()?;
+                self.skip_spaces();
+                if !self.is_kv_colon() {
+                    return Err(self.err("expected ':' after map key"));
+                }
 
-            self.skip_spaces();
-            if !self.is_kv_colon() {
-                return Err(self.err("expected ':' after map key"));
-            }
+                self.advance(); //':'
 
-            self.advance(); //':'
-
-            let value = self.parse_block_map_value(indent)?;
-            pairs.push((key, value));
+                (key, self.parse_block_map_value(indent)?)
+            };
+            pairs.push(entry);
         }
         Ok(())
     }
@@ -153,6 +163,32 @@ impl<'a> Parser<'a> {
             self.advance();
         }
         self.dispatch(next_indent, parent_indent + 1)
+    }
+
+    pub(super) fn parse_explicit_entry(
+        &mut self,
+        indent: usize,
+    ) -> Result<(BorrowedValue<'a>, BorrowedValue<'a>)> {
+        self.advance(); // '?'
+        self.skip_spaces();
+
+        let key = self.parse_node(indent + 1)?;
+
+        self.skip_blank_and_comment_lines();
+
+        if self.at_eof()
+            || self.current_indent()? != indent
+            || !self.is_block_indicator_at(self.pos + indent, b':')
+        {
+            return Ok((key, BorrowedValue::Null));
+        }
+
+        for _ in 0..indent {
+            self.advance();
+        }
+
+        self.advance(); // ':'
+        Ok((key, self.parse_block_map_value(indent)?))
     }
 
     fn is_kv_colon(&self) -> bool {
@@ -498,7 +534,10 @@ mod tests {
         let mut p = Parser::new("a: 1\n  2\n");
         let v = p.parse_node(0).unwrap();
         let a = map_get(&v, "a");
-        assert!(matches!(a, BorrowedValue::String(s) if s == "1 2"), "got {a:?}");
+        assert!(
+            matches!(a, BorrowedValue::String(s) if s == "1 2"),
+            "got {a:?}"
+        );
     }
 
     #[test]
@@ -518,5 +557,98 @@ mod tests {
         let mut p = Parser::new("a: foo\n  bar: baz\n");
         let err = p.parse_node(0).unwrap_err();
         assert_eq!((err.line, err.col), (Some(2), Some(6)));
+    }
+
+    // --- explicit block map keys (§8.2.2.2) ---
+
+    #[test]
+    fn explicit_key_and_value() {
+        assert_map_strs!("? key\n: value\n", vec![("key", "value")]);
+    }
+
+    #[test]
+    fn explicit_key_missing_value_is_null() {
+        // no `:` line -> e-node, and the next line is an ordinary sibling
+        assert_map_strs!("? key\nnext: 1\n", vec![("key", "<null>"), ("next", "1")]);
+    }
+
+    #[test]
+    fn explicit_key_at_eof() {
+        assert_map_strs!("? key\n", vec![("key", "<null>")]);
+    }
+
+    #[test]
+    fn explicit_then_implicit_entry() {
+        assert_map_strs!(
+            "? key\n: value\nplain: 1\n",
+            vec![("key", "value"), ("plain", "1")]
+        );
+    }
+
+    #[test]
+    fn implicit_then_explicit_entry() {
+        assert_map_strs!(
+            "plain: 1\n? key\n: value\n",
+            vec![("plain", "1"), ("key", "value")]
+        );
+    }
+
+    #[test]
+    fn explicit_entry_nested_in_map() {
+        let mut p = Parser::new("top:\n  ? key\n  : value\n  other: 1\n");
+        let v = p.parse_node(0).unwrap();
+        let top = map_get(&v, "top");
+        assert!(matches!(map_get(top, "key"), BorrowedValue::String(s) if s == "value"));
+        assert!(matches!(map_get(top, "other"), BorrowedValue::Int(1)));
+    }
+
+    #[test]
+    fn question_without_space_is_a_plain_key() {
+        // `?` is an indicator only when whitespace, a break, or EOF follows
+        assert_map_strs!("?x: 1\n", vec![("?x", "1")]);
+    }
+
+    #[test]
+    fn explicit_multiline_key_folds() {
+        assert_map_strs!("? one\n  two\n: value\n", vec![("one two", "value")]);
+    }
+
+    #[test]
+    fn explicit_quoted_key() {
+        assert_map_strs!("? \"aaa bbb\"\n: value\n", vec![("aaa bbb", "value")]);
+    }
+
+    #[test]
+    fn explicit_seq_key() {
+        let mut p = Parser::new("?\n  - a\n  - b\n: value\n");
+        let v = p.parse_node(0).unwrap();
+        let pairs = match &v {
+            BorrowedValue::Map(pairs) => pairs,
+            other => panic!("expected Map, got {other:?}"),
+        };
+        assert_eq!(pairs.len(), 1);
+        match &pairs[0].0 {
+            BorrowedValue::Seq(items) => assert_eq!(items.len(), 2),
+            other => panic!("expected Seq key, got {other:?}"),
+        }
+        assert!(matches!(&pairs[0].1, BorrowedValue::String(s) if s == "value"));
+    }
+
+    #[test]
+    fn explicit_map_key() {
+        let mut p = Parser::new("? a: b\n: value\n");
+        let v = p.parse_node(0).unwrap();
+        let pairs = match &v {
+            BorrowedValue::Map(pairs) => pairs,
+            other => panic!("expected Map, got {other:?}"),
+        };
+        assert!(matches!(&pairs[0].0, BorrowedValue::Map(inner) if inner.len() == 1));
+    }
+
+    #[test]
+    fn explicit_value_at_wrong_indent_errors() {
+        // the `:` line must sit at exactly the entry's indent
+        let mut p = Parser::new("? key\n  : value\n");
+        assert!(p.parse_node(0).is_err());
     }
 }
