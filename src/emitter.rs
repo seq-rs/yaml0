@@ -215,10 +215,7 @@ fn key_needs_explicit(k: &BorrowedValue<'_>) -> bool {
     match k {
         BorrowedValue::String(s) => has_newline(s),
         BorrowedValue::Tagged(_, inner) => key_needs_explicit(inner),
-        // flow nodes are legal implicit keys, but the parser does not read
-        // them in key position yet
-        BorrowedValue::Seq(_) | BorrowedValue::Map(_) => true,
-        _ => false,
+        other => !is_inline(other),
     }
 }
 
@@ -282,13 +279,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_container_key_uses_explicit_form() {
-        // `[]: 1` is valid YAML, but the parser does not read flow nodes in
-        // key position, so containers always take the explicit form
+    fn empty_container_key_stays_implicit() {
+        // an empty flow node is a legal implicit key (§7.4.2)
         let seq = BorrowedValue::Map(vec![(BorrowedValue::Seq(vec![]), BorrowedValue::Int(1))]);
-        assert_eq!(roundtrip(&seq), "? []\n: 1\n");
+        assert_eq!(roundtrip(&seq), "[]: 1\n");
         let map = BorrowedValue::Map(vec![(BorrowedValue::Map(vec![]), BorrowedValue::Int(1))]);
-        assert_eq!(roundtrip(&map), "? {}\n: 1\n");
+        assert_eq!(roundtrip(&map), "{}: 1\n");
     }
 
     #[test]
