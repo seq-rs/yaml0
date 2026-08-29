@@ -25,6 +25,7 @@ impl<'a> Parser<'a> {
             return Ok(BorrowedValue::Map(pairs));
         }
 
+        let start_line = self.line;
         let first = self.read_scalar_token()?;
 
         self.skip_spaces();
@@ -32,6 +33,7 @@ impl<'a> Parser<'a> {
         if !self.is_kv_colon() {
             return self.finish_value_token(first, min_indent);
         }
+        self.reject_multiline_key(start_line)?;
 
         self.continue_block_map(first.into_value(), indent)
     }
@@ -92,18 +94,11 @@ impl<'a> Parser<'a> {
             } else {
                 let start_line = self.line;
                 let key = match self.peek() {
-                    Some(b'[') => {
-                        let k = self.parse_flow_seq()?;
-                        self.reject_multiline_key(start_line)?;
-                        k
-                    }
-                    Some(b'{') => {
-                        let k = self.parse_flow_map()?;
-                        self.reject_multiline_key(start_line)?;
-                        k
-                    }
+                    Some(b'[') => self.parse_flow_seq()?,
+                    Some(b'{') => self.parse_flow_map()?,
                     _ => self.parse_scalar_token()?,
                 };
+                self.reject_multiline_key(start_line)?;
 
                 self.skip_spaces();
                 if !self.is_kv_colon() {
@@ -671,9 +666,7 @@ mod tests {
 
     // --- flow nodes as implicit keys (§7.4.2) ---
 
-    fn as_pairs<'a, 'b>(
-        v: &'b BorrowedValue<'a>,
-    ) -> &'b [(BorrowedValue<'a>, BorrowedValue<'a>)] {
+    fn as_pairs<'a, 'b>(v: &'b BorrowedValue<'a>) -> &'b [(BorrowedValue<'a>, BorrowedValue<'a>)] {
         match v {
             BorrowedValue::Map(pairs) => pairs,
             other => panic!("expected Map, got {other:?}"),
@@ -758,5 +751,55 @@ mod tests {
     fn flow_node_in_value_position_is_not_a_key() {
         let v = Parser::new("a: [1, 2]\n").parse_node(0).unwrap();
         assert!(matches!(map_get(&v, "a"), BorrowedValue::Seq(items) if items.len() == 2));
+    }
+
+    // --- implicit keys are single-line (§7.4.2) ---
+
+    #[test]
+    fn multiline_double_quoted_key_errors() {
+        let err = Parser::new("\"a\n b\": v\n").parse_node(0).unwrap_err();
+        assert_eq!((err.line, err.col), (Some(2), Some(4)));
+        assert!(err.msg.contains("span multiple lines"), "got {}", err.msg);
+    }
+
+    #[test]
+    fn multiline_single_quoted_key_errors() {
+        let err = Parser::new("'a\n b': v\n").parse_node(0).unwrap_err();
+        assert_eq!(err.line, Some(2));
+    }
+
+    #[test]
+    fn multiline_quoted_key_as_later_entry_errors() {
+        // the parse_block_map_rest path rather than the dispatch path
+        let err = Parser::new("x: 1\n\"a\n b\": v\n").parse_node(0).unwrap_err();
+        assert_eq!(err.line, Some(3));
+    }
+
+    #[test]
+    fn escaped_newline_in_key_is_allowed() {
+        // `\n` is decoded, not a line break, so the key stays on one line
+        assert_map_strs!("\"a\\nb\": v\n", vec![("a\nb", "v")]);
+    }
+
+    #[test]
+    fn multiline_quoted_value_still_parses() {
+        // the restriction applies to keys only
+        assert_map_strs!("a: \"one\n  two\"\n", vec![("a", "one two")]);
+    }
+
+    #[test]
+    fn explicit_key_may_span_lines() {
+        // `? key` takes a block node, which is exempt from the one-line rule
+        assert_map_strs!("? \"a\n b\"\n: v\n", vec![("a b", "v")]);
+    }
+
+    #[test]
+    fn long_key_accepted() {
+        // §7.4.2 also caps an implicit key at 1024 characters. We do not
+        // enforce that: it bounds parser lookahead rather than meaning
+        // anything, and go-yaml accepts long keys too.
+        let src = format!("\"{}\": 1\n", "x".repeat(1100));
+        let v = Parser::new(&src).parse_node(0).unwrap();
+        assert!(matches!(&as_pairs(&v)[0].0, BorrowedValue::String(s) if s.len() == 1100));
     }
 }
