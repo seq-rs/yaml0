@@ -33,13 +33,17 @@ impl<'a> Parser<'a> {
             return self.finish_value_token(first, min_indent);
         }
 
-        self.advance(); // consume ':'
+        self.continue_block_map(first.into_value(), indent)
+    }
 
-        let key = first.into_value();
-
+    pub(super) fn continue_block_map(
+        &mut self,
+        key: BorrowedValue<'a>,
+        indent: usize,
+    ) -> Result<BorrowedValue<'a>> {
+        self.advance(); // ':'
         let value = self.parse_block_map_value(indent)?;
         let mut pairs = vec![(key, value)];
-
         self.parse_block_map_rest(indent, &mut pairs)?;
         Ok(BorrowedValue::Map(pairs))
     }
@@ -86,7 +90,20 @@ impl<'a> Parser<'a> {
             let entry = if self.at_explicit_key() {
                 self.parse_explicit_entry(indent)?
             } else {
-                let key = self.parse_scalar_token()?;
+                let start_line = self.line;
+                let key = match self.peek() {
+                    Some(b'[') => {
+                        let k = self.parse_flow_seq()?;
+                        self.reject_multiline_key(start_line)?;
+                        k
+                    }
+                    Some(b'{') => {
+                        let k = self.parse_flow_map()?;
+                        self.reject_multiline_key(start_line)?;
+                        k
+                    }
+                    _ => self.parse_scalar_token()?,
+                };
 
                 self.skip_spaces();
                 if !self.is_kv_colon() {
@@ -191,7 +208,7 @@ impl<'a> Parser<'a> {
         Ok((key, self.parse_block_map_value(indent)?))
     }
 
-    fn is_kv_colon(&self) -> bool {
+    pub(super) fn is_kv_colon(&self) -> bool {
         self.peek() == Some(b':')
             && matches!(
                 self.peek_at(self.pos + 1),
@@ -650,5 +667,96 @@ mod tests {
         // the `:` line must sit at exactly the entry's indent
         let mut p = Parser::new("? key\n  : value\n");
         assert!(p.parse_node(0).is_err());
+    }
+
+    // --- flow nodes as implicit keys (§7.4.2) ---
+
+    fn as_pairs<'a, 'b>(
+        v: &'b BorrowedValue<'a>,
+    ) -> &'b [(BorrowedValue<'a>, BorrowedValue<'a>)] {
+        match v {
+            BorrowedValue::Map(pairs) => pairs,
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flow_seq_implicit_key() {
+        let v = Parser::new("[a, b]: 1\n").parse_node(0).unwrap();
+        let pairs = as_pairs(&v);
+        assert_eq!(pairs.len(), 1);
+        assert!(matches!(&pairs[0].0, BorrowedValue::Seq(items) if items.len() == 2));
+        assert!(matches!(pairs[0].1, BorrowedValue::Int(1)));
+    }
+
+    #[test]
+    fn flow_map_implicit_key() {
+        let v = Parser::new("{a: 1}: 2\n").parse_node(0).unwrap();
+        let pairs = as_pairs(&v);
+        assert!(matches!(&pairs[0].0, BorrowedValue::Map(inner) if inner.len() == 1));
+        assert!(matches!(pairs[0].1, BorrowedValue::Int(2)));
+    }
+
+    #[test]
+    fn empty_flow_seq_key() {
+        let v = Parser::new("[]: 1\n").parse_node(0).unwrap();
+        let pairs = as_pairs(&v);
+        assert!(matches!(&pairs[0].0, BorrowedValue::Seq(items) if items.is_empty()));
+    }
+
+    #[test]
+    fn empty_flow_map_key() {
+        let v = Parser::new("{}: 1\n").parse_node(0).unwrap();
+        let pairs = as_pairs(&v);
+        assert!(matches!(&pairs[0].0, BorrowedValue::Map(inner) if inner.is_empty()));
+    }
+
+    #[test]
+    fn flow_key_then_sibling() {
+        let v = Parser::new("[a]: 1\nb: 2\n").parse_node(0).unwrap();
+        let pairs = as_pairs(&v);
+        assert_eq!(pairs.len(), 2);
+        assert!(matches!(&pairs[0].0, BorrowedValue::Seq(_)));
+        assert!(matches!(map_get(&v, "b"), BorrowedValue::Int(2)));
+    }
+
+    #[test]
+    fn flow_key_as_later_entry() {
+        // the parse_block_map_rest path rather than the dispatch path
+        let v = Parser::new("b: 2\n[a]: 1\n").parse_node(0).unwrap();
+        let pairs = as_pairs(&v);
+        assert_eq!(pairs.len(), 2);
+        assert!(matches!(&pairs[1].0, BorrowedValue::Seq(items) if items.len() == 1));
+    }
+
+    #[test]
+    fn flow_key_nested_in_map() {
+        let v = Parser::new("a:\n  [x, y]: 1\n").parse_node(0).unwrap();
+        let inner = as_pairs(map_get(&v, "a"));
+        assert!(matches!(&inner[0].0, BorrowedValue::Seq(items) if items.len() == 2));
+    }
+
+    #[test]
+    fn flow_key_in_seq_item() {
+        let v = Parser::new("- [a]: 1\n").parse_node(0).unwrap();
+        let items = match &v {
+            BorrowedValue::Seq(items) => items,
+            other => panic!("expected Seq, got {other:?}"),
+        };
+        assert!(matches!(&as_pairs(&items[0])[0].0, BorrowedValue::Seq(_)));
+    }
+
+    #[test]
+    fn multiline_flow_key_errors() {
+        // an implicit key must fit on one line
+        let err = Parser::new("[a,\n b]: 1\n").parse_node(0).unwrap_err();
+        assert_eq!(err.line, Some(2));
+        assert!(err.msg.contains("span multiple lines"), "got {}", err.msg);
+    }
+
+    #[test]
+    fn flow_node_in_value_position_is_not_a_key() {
+        let v = Parser::new("a: [1, 2]\n").parse_node(0).unwrap();
+        assert!(matches!(map_get(&v, "a"), BorrowedValue::Seq(items) if items.len() == 2));
     }
 }

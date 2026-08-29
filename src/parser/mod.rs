@@ -255,8 +255,7 @@ impl<'a> Parser<'a> {
     fn dispatch(&mut self, indent: usize, min_indent: usize) -> Result<BorrowedValue<'a>> {
         match self.peek() {
             None => Ok(BorrowedValue::Null),
-            Some(b'[') => self.parse_flow_seq(),
-            Some(b'{') => self.parse_flow_map(),
+            Some(b'[') | Some(b'{') => self.flow_node_or_map(indent),
             Some(b'|') => self.parse_block_scalar(),
             Some(b'>') => self.parse_block_scalar(),
             Some(b'*') => self.parse_alias(),

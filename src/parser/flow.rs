@@ -1,10 +1,6 @@
 use std::borrow::Cow;
 
-use crate::{
-    Parser, Result, BorrowedValue,
-    patterns::resolve_scalar,
-    borrowed_value::apply_tag,
-};
+use crate::{BorrowedValue, Parser, Result, borrowed_value::apply_tag, patterns::resolve_scalar};
 
 impl<'a> Parser<'a> {
     /// Parse a flow-style sequence
@@ -119,10 +115,11 @@ impl<'a> Parser<'a> {
             let mut consumed = false;
 
             if tag.is_none()
-                && let Some(t) = self.try_consume_tag()? {
-                    tag = Some(t);
-                    consumed = true;
-                }
+                && let Some(t) = self.try_consume_tag()?
+            {
+                tag = Some(t);
+                consumed = true;
+            }
 
             if anchor.is_none()
                 && let Some(a) = self.try_consume_anchor()?
@@ -141,8 +138,12 @@ impl<'a> Parser<'a> {
         let value = match self.peek() {
             Some(b'[') => self.parse_flow_seq()?,
             Some(b'{') => self.parse_flow_map()?,
-            Some(b'"') => BorrowedValue::String(self.parse_double_quoted(self.col.saturating_sub(1))?),
-            Some(b'\'') => BorrowedValue::String(self.parse_single_quoted(self.col.saturating_sub(1))?),
+            Some(b'"') => {
+                BorrowedValue::String(self.parse_double_quoted(self.col.saturating_sub(1))?)
+            }
+            Some(b'\'') => {
+                BorrowedValue::String(self.parse_single_quoted(self.col.saturating_sub(1))?)
+            }
             Some(b'*') => self.parse_alias()?,
             Some(b',' | b']' | b'}') | None => BorrowedValue::Null,
             _ => {
@@ -161,6 +162,30 @@ impl<'a> Parser<'a> {
         }
 
         Ok(value)
+    }
+
+    /// Parse a flow node; a `: ` on the same line means it was an implicit key
+    pub(super) fn flow_node_or_map(&mut self, indent: usize) -> Result<BorrowedValue<'a>> {
+        let start_line = self.line;
+        let node = if self.peek() == Some(b'[') {
+            self.parse_flow_seq()?
+        } else {
+            self.parse_flow_map()?
+        };
+
+        self.skip_spaces();
+        if self.is_kv_colon() {
+            self.reject_multiline_key(start_line)?;
+            return self.continue_block_map(node, indent);
+        }
+        Ok(node)
+    }
+
+    pub(super) fn reject_multiline_key(&self, start_line: usize) -> Result<()> {
+        if self.line != start_line {
+            return Err(self.err("implicit key must not span multiple lines"));
+        }
+        Ok(())
     }
 }
 
@@ -196,10 +221,13 @@ mod tests {
     #[test]
     fn flow_seq_simple_strings() {
         let items = as_seq(parse("[a, b, c]\n"));
-        let strs: Vec<&str> = items.iter().map(|v| match v {
-            BorrowedValue::String(s) => s.as_ref(),
-            _ => panic!(),
-        }).collect();
+        let strs: Vec<&str> = items
+            .iter()
+            .map(|v| match v {
+                BorrowedValue::String(s) => s.as_ref(),
+                _ => panic!(),
+            })
+            .collect();
         assert_eq!(strs, vec!["a", "b", "c"]);
     }
 
