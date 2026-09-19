@@ -2,6 +2,45 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0](https://github.com/seq-rs/yaml0/-/releases/tag/v0.4.0) - 2026-09-19
+
+
+### Security
+- **(code scanning alert)** Minimum permission specification in ci.yml ([`addd7e2`](https://github.com/seq-rs/yaml0/-/commit/addd7e2a7efa2ae8a9f4f0046bdd654a3bc68d75))
+
+
+### Features
+- Editing tests + lazygit fixture ([`8573e02`](https://github.com/seq-rs/yaml0/-/commit/8573e0242c55dcf27201f09017b9c5a51ed04d65))
+- DocumentView + Document wrapper for reading and editing YAML streams, unit tests to validate ([`ed686bf`](https://github.com/seq-rs/yaml0/-/commit/ed686bf6244b8b5e3bb01f3188b4466048d1805f))
+- In-place editing of YAML streams based on paths at runtime or compile-time ([`8e3dd61`](https://github.com/seq-rs/yaml0/-/commit/8e3dd611188d1b9aed8a18191809d8d17f2a8c0e))
+- Span recording at parse-time ([`7d47bf9`](https://github.com/seq-rs/yaml0/-/commit/7d47bf9bf721851346718b4e8e6871ae00ccd2d6))
+- Path search in parsed YAML stream ([`eea7fba`](https://github.com/seq-rs/yaml0/-/commit/eea7fbae40bdd4a73c6cd009adbeabd27d20e48b))
+
+
+### Fixes
+- Exports ([`63918d8`](https://github.com/seq-rs/yaml0/-/commit/63918d879ea109f1489dd66633e8dace6d77a381))
+
+
+### Release process
+- Prepare for the "edit" feature ([`167c761`](https://github.com/seq-rs/yaml0/-/commit/167c761830cd98ea4fc079a38e5b71620db67aa2))
+
+## [0.3.0](https://github.com/seq-rs/yaml0/-/releases/tag/v0.3.0) - 2026-08-29
+
+
+### Features
+- **(emitter)** Flow nodes as implicit map keys ([`b16256a`](https://github.com/seq-rs/yaml0/-/commit/b16256a9edd555ae02c5c8be98aeea5acfd2e224))
+- **(parser)** Flow nodes as implicit map keys ([`b7981ff`](https://github.com/seq-rs/yaml0/-/commit/b7981fff98da9efcbcc1c6229bc662d7292cc956))
+- Explicit key handling ([`da93980`](https://github.com/seq-rs/yaml0/-/commit/da939809b15ffedbf4d0b68810940b5db95ef1e8))
+
+
+### Fixes
+- **(parser)** Reject multi-line implicit keys ([`86a2bea`](https://github.com/seq-rs/yaml0/-/commit/86a2bea3eda6cf6b49c0c7dfc393e4f4dfba0f1b))
+- **(parser)** Multi-line plain scalars and document boundaries ([`59db15e`](https://github.com/seq-rs/yaml0/-/commit/59db15e76a59c5bf5ae8d80fe365b5cf831704f7))
+
+
+### Release process
+- **(actions)** Use seq-rs/actions instead of rust-cache and release ([`23352d6`](https://github.com/seq-rs/yaml0/-/commit/23352d67eeb975abd03035e2b19c751b62a800b2))
+
 ## [0.2.0](https://github.com/seq-rs/yaml0/-/releases/tag/v0.2.0) - 2026-06-10
 
 
