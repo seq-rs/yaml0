@@ -10,9 +10,16 @@ use std::ops::Range;
 mod locate;
 #[cfg(feature = "edit")]
 mod path;
+#[cfg(feature = "edit")]
+mod plan;
+#[cfg(feature = "edit")]
+mod set;
 pub(crate) mod sink;
 #[cfg(feature = "edit")]
 pub use path::parse_path;
+#[cfg(feature = "edit")]
+pub use set::{SetOpts, SetOutcome, set, set_with};
+
 /// A path segment representing one level of descent into a YAML stream.
 ///
 /// [`Segment::Doc`] is only meaningful as the leading segment; absent, document 0.
@@ -41,6 +48,7 @@ impl From<usize> for Segment<'_> {
 }
 
 /// Describes what the located bytes are, helps decide if an edit is safe (breaks guarantees or not,
+/// see [`SetOpts`])
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind<'a> {
     /// An ordinary value. Editing it changes nothing else.
