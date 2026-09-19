@@ -7,6 +7,8 @@
 use std::ops::Range;
 
 #[cfg(feature = "edit")]
+mod locate;
+#[cfg(feature = "edit")]
 mod path;
 pub(crate) mod sink;
 #[cfg(feature = "edit")]
