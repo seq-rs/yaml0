@@ -11,6 +11,10 @@ description = "Implementation of serde serialization and deserialization from YA
 rust-version = "1.96.0"
 categories = ["encoding", "parser-implementations", "parsing"]
 
+[features]
+default = []
+edit = []
+
 [lib]
 name = "yaml0"
 path = "src/lib.rs"

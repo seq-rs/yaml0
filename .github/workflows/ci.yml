@@ -18,4 +18,5 @@ jobs:
       - uses: seq-rs/actions/rust-cache@v1
       - run: cargo check --workspace
       - run: cargo test --workspace
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo test --workspace --all-features
+      - run: cargo clippy --workspace --all-features -- -D warnings

@@ -22,6 +22,7 @@ jobs:
       - uses: seq-rs/actions/rust-cache@v1
 
       - run: cargo test --workspace
+      - run: cargo test --workspace --all-features
 
 
       - run: cargo publish -p yaml0
