@@ -1,0 +1,20 @@
+# lazygit configuration
+# https://github.com/jesseduffield/lazygit
+gui:
+  # colours used for the border of the focused panel
+  activeBorderColor:
+    - green
+    - bold
+  showIcons: true          # requires a nerd font
+  mouseEvents: true
+
+git:
+  paging:
+    colorArg: always
+    pager: delta --dark --paging=never
+  autoFetch: false         # avoid network on open
+  branchLogCmd: git log --graph --color=always
+
+os:
+  editPreset: nvim
+  editCommand: ''
