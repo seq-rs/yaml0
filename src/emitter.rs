@@ -98,7 +98,7 @@ fn emit_block_scalar(s: &str, indent: usize, out: &mut String) {
 }
 
 fn emit_quoted_scalar(s: &str, out: &mut String) {
-    if !has_ctrl_chars(s) && !s.contains('\'') {
+    if !has_ctrl_chars(s) && !has_newline(s) && !s.contains('\'') {
         out.push('\'');
         out.push_str(s);
         out.push('\'');
@@ -107,7 +107,7 @@ fn emit_quoted_scalar(s: &str, out: &mut String) {
     }
 }
 
-fn emit_double_quoted(s: &str, out: &mut String) {
+pub(crate) fn emit_double_quoted(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {

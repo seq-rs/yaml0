@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::{BorrowedValue, Parser, Result};
 
 impl<'a> Parser<'a> {
@@ -26,6 +28,7 @@ impl<'a> Parser<'a> {
         }
 
         let start_line = self.line;
+        let key_start = self.pos;
         let first = self.read_scalar_token()?;
 
         self.skip_spaces();
@@ -35,14 +38,22 @@ impl<'a> Parser<'a> {
         }
         self.reject_multiline_key(start_line)?;
 
-        self.continue_block_map(first.into_value(), indent)
+        self.continue_block_map(first.into_value(), key_start, indent)
     }
 
+    /// `key_start` is the key's first byte; the cursor is on the `:`, so the
+    /// key's extent is everything up to there minus separating whitespace.
     pub(super) fn continue_block_map(
         &mut self,
         key: BorrowedValue<'a>,
+        key_start: usize,
         indent: usize,
     ) -> Result<BorrowedValue<'a>> {
+        let key_end = self.trimmed_pos(key_start);
+        if let Some(s) = self.sink() {
+            s.key(key_start..key_end, scalar_key_text(&key));
+        }
+
         self.advance(); // ':'
         let value = self.parse_block_map_value(indent)?;
         let mut pairs = vec![(key, value)];
@@ -93,6 +104,7 @@ impl<'a> Parser<'a> {
                 self.parse_explicit_entry(indent)?
             } else {
                 let start_line = self.line;
+                let key_start = self.pos;
                 let key = match self.peek() {
                     Some(b'[') => self.parse_flow_seq()?,
                     Some(b'{') => self.parse_flow_map()?,
@@ -103,6 +115,11 @@ impl<'a> Parser<'a> {
                 self.skip_spaces();
                 if !self.is_kv_colon() {
                     return Err(self.err("expected ':' after map key"));
+                }
+
+                let key_end = self.trimmed_pos(key_start);
+                if let Some(s) = self.sink() {
+                    s.key(key_start..key_end, scalar_key_text(&key));
                 }
 
                 self.advance(); //':'
@@ -143,6 +160,7 @@ impl<'a> Parser<'a> {
         self.skip_blank_and_comment_lines();
 
         if self.at_eof() {
+            self.record_empty();
             return Ok(BorrowedValue::Null);
         }
 
@@ -160,14 +178,18 @@ impl<'a> Parser<'a> {
                 for _ in 0..next_indent {
                     self.advance();
                 }
-                return self.parse_block_seq(next_indent);
+                // Through dispatch, not parse_block_seq directly: the seq is a
+                // node of its own and must open its own frame.
+                return self.dispatch(next_indent, parent_indent + 1);
             }
 
             // Same indent, not a dash: value is empty (next line sibling)
+            self.record_empty();
             return Ok(BorrowedValue::Null);
         }
 
         if next_indent < parent_indent + 1 {
+            self.record_empty();
             return Ok(BorrowedValue::Null);
         }
 
@@ -184,7 +206,11 @@ impl<'a> Parser<'a> {
         self.advance(); // '?'
         self.skip_spaces();
 
+        // The key arrived as a child node of the enclosing map; re-file it.
         let key = self.parse_node(indent + 1)?;
+        if let Some(s) = self.sink() {
+            s.promote_last_child_to_key(scalar_key_text(&key));
+        }
 
         self.skip_blank_and_comment_lines();
 
@@ -192,6 +218,7 @@ impl<'a> Parser<'a> {
             || self.current_indent()? != indent
             || !self.is_block_indicator_at(self.pos + indent, b':')
         {
+            self.record_empty();
             return Ok((key, BorrowedValue::Null));
         }
 
@@ -209,6 +236,20 @@ impl<'a> Parser<'a> {
                 self.peek_at(self.pos + 1),
                 None | Some(b' ' | b'\t' | b'\n' | b'\r')
             )
+    }
+}
+
+/// Text a [`Segment::Key`](crate::edit::Segment::Key) can match this key by.
+///
+/// `None` for collection and null keys, which aren't addressable by name.
+pub(super) fn scalar_key_text<'a>(key: &BorrowedValue<'a>) -> Option<Cow<'a, str>> {
+    match key {
+        BorrowedValue::String(s) => Some(s.clone()),
+        BorrowedValue::Bool(b) => Some(Cow::Borrowed(if *b { "true" } else { "false" })),
+        BorrowedValue::Int(n) => Some(Cow::Owned(n.to_string())),
+        BorrowedValue::Float(f) => Some(Cow::Owned(f.to_string())),
+        BorrowedValue::Null | BorrowedValue::Seq(_) | BorrowedValue::Map(_) => None,
+        BorrowedValue::Tagged(_, inner) => scalar_key_text(inner),
     }
 }
 

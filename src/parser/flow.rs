@@ -1,6 +1,9 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Range};
 
-use crate::{BorrowedValue, Parser, Result, borrowed_value::apply_tag, patterns::resolve_scalar};
+use crate::{
+    BorrowedValue, Parser, Result, borrowed_value::apply_tag, parser::block_map::scalar_key_text,
+    patterns::resolve_scalar, edit::NodeKind,
+};
 
 impl<'a> Parser<'a> {
     /// Parse a flow-style sequence
@@ -70,16 +73,24 @@ impl<'a> Parser<'a> {
 
             let key = self.parse_flow_node()?;
 
+            if let Some(s) = self.sink() {
+                s.promote_last_child_to_key(scalar_key_text(&key));
+            }
+
             self.skip_flow_whitespace();
 
             let value = if self.peek() == Some(b':') {
                 self.advance();
                 self.skip_flow_whitespace();
                 match self.peek() {
-                    Some(b',' | b'}') | None => BorrowedValue::Null,
+                    Some(b',' | b'}') | None => {
+                        self.record_empty();
+                        BorrowedValue::Null
+                    }
                     _ => self.parse_flow_node()?,
                 }
             } else {
+                self.record_empty(); // `{a, b}`: implicit null
                 BorrowedValue::Null // implicit null value, like {a, b}
             };
 
@@ -109,7 +120,7 @@ impl<'a> Parser<'a> {
     /// either order, just like block context.
     fn parse_flow_node(&mut self) -> Result<BorrowedValue<'a>> {
         let mut tag: Option<Cow<'a, str>> = None;
-        let mut anchor: Option<&'a str> = None;
+        let mut anchor: Option<(&'a str, Range<usize>)> = None;
 
         loop {
             let mut consumed = false;
@@ -122,9 +133,9 @@ impl<'a> Parser<'a> {
             }
 
             if anchor.is_none()
-                && let Some(a) = self.try_consume_anchor()?
+                && let Some(found) = self.try_consume_anchor()?
             {
-                anchor = Some(a);
+                anchor = Some(found);
                 consumed = true;
             }
 
@@ -135,7 +146,35 @@ impl<'a> Parser<'a> {
             self.skip_flow_whitespace();
         }
 
-        let value = match self.peek() {
+        let (src, start) = (self.src, self.pos);
+        let delimited = matches!(self.peek(), Some(b'[' | b'{'));
+        if let Some(s) = self.sink() {
+            s.open(start, delimited);
+        }
+        let result = self.parse_flow_value();
+        let end = self.pos;
+        if let Some(s) = self.sink() {
+            s.close(end, src);
+        }
+        let value = result?;
+
+        let value = match tag {
+            Some(t) => apply_tag(t, value),
+            None => value,
+        };
+
+        if let Some((name, token)) = anchor {
+            if let Some(s) = self.sink() {
+                s.set_anchor(name, token);
+            }
+            self.anchors.insert(name, value.clone());
+        }
+
+        Ok(value)
+    }
+
+    fn parse_flow_value(&mut self) -> Result<BorrowedValue<'a>> {
+        Ok(match self.peek() {
             Some(b'[') => self.parse_flow_seq()?,
             Some(b'{') => self.parse_flow_map()?,
             Some(b'"') => {
@@ -144,29 +183,22 @@ impl<'a> Parser<'a> {
             Some(b'\'') => {
                 BorrowedValue::String(self.parse_single_quoted(self.col.saturating_sub(1))?)
             }
-            Some(b'*') => self.parse_alias()?,
-            Some(b',' | b']' | b'}') | None => BorrowedValue::Null,
-            _ => {
-                let s = self.parse_plain_scalar(true);
-                resolve_scalar(s)
+            Some(b'*') => {
+                let (value, name) = self.parse_alias_named()?;
+                if let Some(s) = self.sink() {
+                    s.kind_open(NodeKind::AliasRef(name));
+                }
+                value
             }
-        };
-
-        let value = match tag {
-            Some(t) => apply_tag(t, value),
-            None => value,
-        };
-
-        if let Some(name) = anchor {
-            self.anchors.insert(name, value.clone());
-        }
-
-        Ok(value)
+            Some(b',' | b']' | b'}') | None => BorrowedValue::Null,
+            _ => resolve_scalar(self.parse_plain_scalar(true)),
+        })
     }
 
     /// Parse a flow node; a `: ` on the same line means it was an implicit key
     pub(super) fn flow_node_or_map(&mut self, indent: usize) -> Result<BorrowedValue<'a>> {
         let start_line = self.line;
+        let key_start = self.pos;
         let node = if self.peek() == Some(b'[') {
             self.parse_flow_seq()?
         } else {
@@ -176,7 +208,7 @@ impl<'a> Parser<'a> {
         self.skip_spaces();
         if self.is_kv_colon() {
             self.reject_multiline_key(start_line)?;
-            return self.continue_block_map(node, indent);
+            return self.continue_block_map(node, key_start, indent);
         }
         Ok(node)
     }

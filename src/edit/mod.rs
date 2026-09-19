@@ -6,6 +6,11 @@
 
 use std::ops::Range;
 
+#[cfg(feature = "edit")]
+mod path;
+pub(crate) mod sink;
+#[cfg(feature = "edit")]
+pub use path::parse_path;
 /// A path segment representing one level of descent into a YAML stream.
 ///
 /// [`Segment::Doc`] is only meaningful as the leading segment; absent, document 0.

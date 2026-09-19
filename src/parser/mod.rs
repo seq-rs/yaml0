@@ -6,11 +6,12 @@ mod escape;
 mod flow;
 mod scalar;
 
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, ops::Range};
 
 use crate::{
     BorrowedValue, Result,
     borrowed_value::{apply_tag, resolve_merge_keys},
+    edit::{NodeKind, sink::SpanSink},
     patterns::resolve_scalar,
 };
 
@@ -49,6 +50,7 @@ pub struct Parser<'a> {
     /// 1-based column for errors
     pub(super) col: usize,
     pub(super) anchors: HashMap<&'a str, crate::BorrowedValue<'a>>,
+    pub(super) sink: Option<Box<SpanSink<'a>>>,
 }
 
 impl<'a> Parser<'a> {
@@ -60,8 +62,43 @@ impl<'a> Parser<'a> {
             pos: 0,
             line: 1,
             col: 1,
+            sink: None,
             anchors: HashMap::new(),
         }
+    }
+
+    #[cfg(feature = "edit")]
+    pub(crate) fn with_spans(src: &'a str) -> Self {
+        Self {
+            sink: Some(Box::new(SpanSink::new())),
+            ..Self::new(src)
+        }
+    }
+
+    #[cfg(feature = "edit")]
+    pub(crate) fn take_sink(self) -> Box<SpanSink<'a>> {
+        self.sink.expect("parser was not span-recording")
+    }
+
+    #[inline]
+    pub(super) fn sink(&mut self) -> Option<&mut SpanSink<'a>> {
+        self.sink.as_deref_mut()
+    }
+
+    /// Record a node that consumes no bytes: an empty map value, or a node
+    /// terminated by a document marker, EOF, or a dedent.
+    #[inline]
+    pub(super) fn record_empty(&mut self) {
+        let (src, at) = (self.src, self.pos);
+        if let Some(s) = self.sink() {
+            s.empty(at, src);
+        }
+    }
+
+    /// Cursor position with trailing spaces/tabs since `start` discounted.
+    #[inline]
+    pub(super) fn trimmed_pos(&self, start: usize) -> usize {
+        start + trim_trailing_whitespace_end(&self.src.as_bytes()[start..self.pos])
     }
 
     /// Parse all documents in the YAML stream
@@ -113,6 +150,10 @@ impl<'a> Parser<'a> {
             if allow_bare {
                 self.consume_doc_marker(3);
             }
+        }
+
+        if let Some(s) = self.sink() {
+            s.finish();
         }
         Ok(docs)
     }
@@ -178,22 +219,26 @@ impl<'a> Parser<'a> {
         // Catch doc markers at cursor (covers entries from parse_all where
         // consume_doc_marker has just advanced past the line break)
         if self.at_doc_marker(b"---") || self.at_doc_marker(b"...") {
+            self.record_empty();
             return Ok(BorrowedValue::Null);
         }
 
         let indent = if self.at_line_end() {
             self.skip_blank_and_comment_lines();
             if self.at_eof() {
+                self.record_empty();
                 return Ok(BorrowedValue::Null);
             }
 
             // Document boundary terminates a node — parse_all handles the marker
             if self.at_doc_marker(b"---") || self.at_doc_marker(b"...") {
+                self.record_empty();
                 return Ok(BorrowedValue::Null);
             }
 
             let indent = self.current_indent()?;
             if indent < min_indent {
+                self.record_empty();
                 return Ok(BorrowedValue::Null);
             }
 
@@ -209,7 +254,7 @@ impl<'a> Parser<'a> {
 
         // tags and anchors prefix the node, for now just markers
         let mut tag: Option<Cow<'_, str>> = None;
-        let mut anchor: Option<&'a str> = None;
+        let mut anchor: Option<(&'a str, Range<usize>)> = None;
 
         loop {
             let mut consumed = false;
@@ -244,21 +289,47 @@ impl<'a> Parser<'a> {
             None => value,
         };
 
-        if let Some(name) = anchor {
+        if let Some((name, token)) = anchor {
+            if let Some(s) = self.sink() {
+                s.set_anchor(name, token);
+            }
             self.anchors.insert(name, value.clone());
         }
 
         Ok(value)
     }
 
-    /// Route the cursor to the right node parser based on the next byte
     fn dispatch(&mut self, indent: usize, min_indent: usize) -> Result<BorrowedValue<'a>> {
+        let (src, start) = (self.src, self.pos); // &'a str is Copy, sidesteps borrow
+        // conflict in close()
+        let delimited = matches!(self.peek(), Some(b'[' | b'{'));
+        if let Some(s) = self.sink() {
+            s.open(start, delimited);
+        }
+        let result = self.dispatch_inner(indent, min_indent);
+        let end = self.pos;
+        if let Some(s) = self.sink() {
+            s.close(end, src);
+        }
+        result
+    }
+
+    /// Route the cursor to the right node parser based on the next byte
+    fn dispatch_inner(&mut self, indent: usize, min_indent: usize) -> Result<BorrowedValue<'a>> {
         match self.peek() {
             None => Ok(BorrowedValue::Null),
             Some(b'[') | Some(b'{') => self.flow_node_or_map(indent),
             Some(b'|') => self.parse_block_scalar(),
             Some(b'>') => self.parse_block_scalar(),
-            Some(b'*') => self.parse_alias(),
+            Some(b'*') => {
+                let (value, name) = self.parse_alias_named()?;
+                // Only an alias reached through dispatch is a node of its own;
+                // one inside a flow container belongs to that container.
+                if let Some(s) = self.sink() {
+                    s.kind_open(NodeKind::AliasRef(name));
+                }
+                Ok(value)
+            }
             Some(b'-') if self.at_seq_dash() => self.parse_block_seq(indent),
             _ => self.parse_scalar_or_map(indent, min_indent),
         }
@@ -271,14 +342,15 @@ impl<'a> Parser<'a> {
     /// &id 42
     /// ```
     ///
-    /// Output: `Some("id")`, cursor positioned at `42`. Returns `None` (no
-    /// advance) if the next byte isn't `&`. The name's lifetime is borrowed
-    /// from source.
-    fn try_consume_anchor(&mut self) -> Result<Option<&'a str>> {
+    /// Output: `Some(("id", 0..3))` — the name, and the `&id` token's span —
+    /// cursor positioned at `42`. Returns `None` (no advance) if the next byte
+    /// isn't `&`. The name's lifetime is borrowed from source.
+    fn try_consume_anchor(&mut self) -> Result<Option<(&'a str, Range<usize>)>> {
         if self.peek() != Some(b'&') {
             return Ok(None);
         }
 
+        let token_start = self.pos;
         self.advance();
 
         let start = self.pos;
@@ -298,22 +370,16 @@ impl<'a> Parser<'a> {
         }
 
         let name = &self.src[start..self.pos];
+        let token = token_start..self.pos;
 
         self.skip_spaces();
 
-        Ok(Some(name))
+        Ok(Some((name, token)))
     }
 
-    /// Resolve a `*name` alias to a clone of the anchored value
-    ///
-    /// Input (with anchor `id` previously registered as `Int(42)`):
-    /// ```yaml
-    /// *id
-    /// ```
-    ///
-    /// Output: `BorrowedValue::Int(42)` (cloned from the anchors map). Errors if
-    /// the anchor name is unknown or empty.
-    fn parse_alias(&mut self) -> Result<BorrowedValue<'a>> {
+    /// [`parse_alias`](Self::parse_alias), also yielding the anchor name so
+    /// callers can record which anchor this site refers to.
+    fn parse_alias_named(&mut self) -> Result<(BorrowedValue<'a>, &'a str)> {
         self.advance(); // consume '*'
 
         let start = self.pos;
@@ -334,7 +400,7 @@ impl<'a> Parser<'a> {
         let name = &self.src[start..self.pos];
 
         match self.anchors.get(name) {
-            Some(v) => Ok(v.clone()),
+            Some(v) => Ok((v.clone(), name)),
             None => Err(self.err(format!("unknown anchor: '{name}'"))),
         }
     }
@@ -463,7 +529,7 @@ fn tab(b: u8) -> bool {
     matches!(b, b'\t')
 }
 
-fn trim_trailing_whitespace_end(bytes: &[u8]) -> usize {
+pub(crate) fn trim_trailing_whitespace_end(bytes: &[u8]) -> usize {
     let mut n = bytes.len();
     while n > 0 && matches!(bytes[n - 1], b' ' | b'\t') {
         n -= 1
