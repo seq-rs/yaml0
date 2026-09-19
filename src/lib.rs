@@ -5,6 +5,7 @@
 //! - Filling the gap after archival of `serde-yaml`
 //! - Best effort compliance to support common docker-compose, kubernetes resource and configuration files
 //! - Trustworthy, least-dependencies implementation to avoid the trust issues surrounding other similarly motivated replacement crates dismissed for suspicious, inexplicable dependencies and code
+//! - (new) Providing in-place edits on `yaml` documents using the `edit` feature. See `crate::edit`
 //!
 //! ## Quick start
 //!
@@ -184,6 +185,7 @@
 //! This ordering rule is a property of serde's untagged matching, not of yaml0;
 //! it applies to any self-describing format.
 //!
+#![cfg_attr(feature = "edit", doc = include_str!("../docs/edit.md"))]
 //! ## YAML spec coverage
 //!
 //! Per YAML 1.2 specification:
@@ -205,8 +207,9 @@
 //!
 //! ## Design principles
 //!
-//! - **Spec-correct parser, pragmatic emitter.** Roundtrip-equal in *data*, not
-//!   necessarily byte-identical in *presentation*.
+//! - **Spec-correct parser, pragmatic emitter:** Roundtrip-equal in *data*, not necessarily byte-identical in
+//!   *presentation* (comments, quoting, `|` markers, etc). See [`edit`] if you want byte-identical
+//!   round-trips including syntax choices!
 //! - **Zero-copy using `Cow<'a, str>`:** Plain and unescaped quoted scalars are borrowed slices of the input,
 //!   only allocated when escapes or folds force it.
 //! - **Lossless resolution of scalars:** Plain `42` → `Int(42)`, quoted `"42"` stays `String("42")`.
@@ -225,6 +228,11 @@ mod value;
 
 pub use borrowed_value::BorrowedValue;
 pub use de::{from_str, from_value};
+#[cfg(feature = "edit")]
+pub use edit::{
+    Applied, Change, Document, DocumentView, Edit, Located, NodeKind, Segment, SetOpts, SetOutcome,
+    locate, parse_path, set, set_with,
+};
 pub use error::{Error, Result};
 pub use parser::Parser;
 pub use ser::to_value;
